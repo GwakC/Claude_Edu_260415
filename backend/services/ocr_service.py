@@ -1,18 +1,16 @@
-import base64
-import io
 import json
 import os
-import uuid
-from datetime import datetime, timezone
 
-from PIL import Image
+import requests as http_requests
 from langchain_upstage import ChatUpstage
 from langchain_core.messages import HumanMessage, SystemMessage
 
-DATA_FILE = os.path.join(os.path.dirname(__file__), "../data/expenses.json")
+from services.storage_service import append_expense
+
+UPSTAGE_OCR_URL = "https://api.upstage.ai/v1/document-digitization"
 
 SYSTEM_PROMPT = """당신은 영수증 OCR 전문가입니다.
-영수증 이미지를 분석하여 반드시 아래 JSON 형식으로만 응답하세요. 다른 텍스트는 절대 포함하지 마세요.
+아래 영수증 텍스트를 분석하여 반드시 아래 JSON 형식으로만 응답하세요. 다른 텍스트는 절대 포함하지 마세요.
 
 {
   "store_name": "가게명 (string, 필수)",
@@ -21,9 +19,9 @@ SYSTEM_PROMPT = """당신은 영수증 OCR 전문가입니다.
   "category": "카테고리 (식료품|외식|교통|쇼핑|의료|기타 중 하나)",
   "items": [
     {
-      "name": "품목명",
+      "name": "품목명 (영수증 원문 그대로 유지. RB 1샷 등 샷 추가 항목은 별도 item 금지, 직전 메뉴 name 끝에 '+ 샷추가' 를 붙이고 금액 합산)",
       "quantity": 수량(int),
-      "unit_price": 단가(int),
+      "unit_price": 단가(int, 샷추가 금액 포함),
       "total_price": 소계(int)
     }
   ],
@@ -35,33 +33,30 @@ SYSTEM_PROMPT = """당신은 영수증 OCR 전문가입니다.
 }"""
 
 
-def _to_base64_jpeg(contents: bytes, content_type: str) -> str:
-    """이미지 또는 PDF 첫 페이지를 Base64 JPEG 문자열로 변환"""
-    if content_type == "application/pdf":
-        from pdf2image import convert_from_bytes
+def _ocr_extract_text(contents: bytes, content_type: str, filename: str) -> str:
+    """Upstage Document OCR API로 이미지/PDF에서 텍스트 추출"""
+    api_key = os.environ["UPSTAGE_API_KEY"]
+    headers = {"Authorization": f"Bearer {api_key}"}
+    files = {"document": (filename, contents, content_type)}
+    data = {"model": "ocr"}
 
-        images = convert_from_bytes(contents, first_page=1, last_page=1, dpi=200)
-        img = images[0]
-    else:
-        img = Image.open(io.BytesIO(contents)).convert("RGB")
+    response = http_requests.post(
+        UPSTAGE_OCR_URL, headers=headers, files=files, data=data
+    )
+    response.raise_for_status()
 
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85)
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
+    result = response.json()
+    pages = result.get("pages", [])
+    full_text = "\n".join(page.get("text", "") for page in pages)
 
+    if not full_text.strip():
+        raise ValueError("OCR 결과에서 텍스트를 추출할 수 없습니다.")
 
-def _append_to_file(expense: dict) -> None:
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    data.append(expense)
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    return full_text.strip()
 
 
-async def parse_receipt(contents: bytes, content_type: str, filename: str) -> dict:
-    """Upstage Vision LLM으로 영수증 파싱 후 expenses.json에 저장"""
-    b64_image = _to_base64_jpeg(contents, content_type)
-
+def _parse_with_llm(ocr_text: str) -> dict:
+    """ChatUpstage (solar-pro)로 OCR 텍스트 → 구조화 JSON"""
     llm = ChatUpstage(
         api_key=os.environ["UPSTAGE_API_KEY"],
         model="solar-pro",
@@ -69,35 +64,36 @@ async def parse_receipt(contents: bytes, content_type: str, filename: str) -> di
 
     messages = [
         SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(
-            content=[
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"},
-                },
-                {"type": "text", "text": "이 영수증의 내용을 JSON으로 추출해주세요."},
-            ]
-        ),
+        HumanMessage(content=f"다음 영수증 텍스트를 JSON으로 추출해주세요:\n\n{ocr_text}"),
     ]
 
     response = llm.invoke(messages)
     raw_text = response.content.strip()
 
-    # ```json ... ``` 블록 처리
+    # ```json ... ``` 마크다운 블록 제거
     if raw_text.startswith("```"):
         raw_text = raw_text.split("```")[1]
         if raw_text.startswith("json"):
             raw_text = raw_text[4:]
         raw_text = raw_text.strip()
 
-    parsed = json.loads(raw_text)
+    return json.loads(raw_text)
 
-    expense = {
-        "id": str(uuid.uuid4()),
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "raw_image_path": f"uploads/{filename}",
-        **parsed,
-    }
 
-    _append_to_file(expense)
+async def parse_receipt(contents: bytes, content_type: str, filename: str) -> dict:
+    """
+    영수증 파싱 파이프라인:
+    1. Upstage OCR API → 텍스트 추출
+    2. ChatUpstage LLM → 구조화 JSON
+    3. expenses.json 저장
+    """
+    ocr_text = _ocr_extract_text(contents, content_type, filename)
+    parsed = _parse_with_llm(ocr_text)
+
+    expense = append_expense(
+        {
+            "raw_image_path": f"uploads/{filename}",
+            **parsed,
+        }
+    )
     return expense
